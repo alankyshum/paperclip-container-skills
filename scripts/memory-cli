@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# memory-cli — Graphiti MCP Memory client via Streamable HTTP
+# Adapted from Claude skill tool--memory for use inside Paperclip container
+# Usage: memory-cli <command> [args...]
+
+set -euo pipefail
+
+MEMORY_URL="${MEMORY_URL:-https://memory.persoack.org}"
+MCP_ENDPOINT="${MEMORY_URL}/mcp"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+_init_session() {
+  local resp
+  resp=$(curl -s -D /tmp/memory-cli-headers -X POST "$MCP_ENDPOINT" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"paperclip-memory-cli","version":"1.0"}}}')
+
+  SESSION_ID=$(grep -i "mcp-session-id" /tmp/memory-cli-headers | sed 's/.*: //' | tr -d '\r\n')
+
+  if [ -z "$SESSION_ID" ]; then
+    echo '{"error": "Failed to initialize MCP session"}' >&2
+    exit 1
+  fi
+
+  curl -s -X POST "$MCP_ENDPOINT" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "Mcp-Session-Id: $SESSION_ID" \
+    -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' > /dev/null 2>&1
+}
+
+_call_tool() {
+  local tool_name="$1"
+  local args_json="$2"
+
+  _init_session
+
+  local resp
+  resp=$(curl -s -X POST "$MCP_ENDPOINT" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "Mcp-Session-Id: $SESSION_ID" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"${tool_name}\",\"arguments\":${args_json}}}")
+
+  echo "$resp" | grep '^data: ' | sed 's/^data: //' | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    result = data.get('result', {})
+    content = result.get('content', [{}])[0].get('text', '{}')
+    is_error = result.get('isError', False)
+    parsed = json.loads(content)
+    if is_error:
+        print(json.dumps({'error': parsed}, indent=2))
+    else:
+        print(json.dumps(parsed, indent=2))
+except Exception as e:
+    print(json.dumps({'error': str(e)}))
+"
+}
+
+_list_tools() {
+  _init_session
+
+  local resp
+  resp=$(curl -s -X POST "$MCP_ENDPOINT" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "Mcp-Session-Id: $SESSION_ID" \
+    -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
+
+  echo "$resp" | grep '^data: ' | sed 's/^data: //' | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+tools = data.get('result', {}).get('tools', [])
+for t in tools:
+    name = t['name']
+    desc = t.get('description', '').split('\n')[0][:80]
+    schema = t.get('inputSchema', {}).get('properties', {})
+    required = t.get('inputSchema', {}).get('required', [])
+    params = []
+    for k, v in schema.items():
+        req = '*' if k in required else ''
+        params.append(f'{k}{req}')
+    print(f'{name}({\", \".join(params)})')
+    print(f'  {desc}')
+    print()
+"
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  add)
+    name="${1:?Usage: memory-cli add <name> <body> [group_id] [source]}"
+    body="${2:?Usage: memory-cli add <name> <body> [group_id] [source]}"
+    group_id="${3:-main}"
+    source="${4:-paperclip-agent}"
+    name_escaped=$(python3 -c "import json; print(json.dumps($( printf '%s' "$name" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" )))" | sed 's/^"//;s/"$//')
+    body_escaped=$(python3 -c "import json; print(json.dumps($( printf '%s' "$body" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" )))" | sed 's/^"//;s/"$//')
+    _call_tool "add_memory" "{\"name\":\"${name_escaped}\",\"episode_body\":\"${body_escaped}\",\"group_id\":\"${group_id}\",\"source_description\":\"${source}\"}"
+    ;;
+
+  search-nodes|nodes)
+    query="${1:?Usage: memory-cli search-nodes <query> [group_id]}"
+    group_id="${2:-main}"
+    query_escaped=$(printf '%s' "$query" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" | sed 's/^"//;s/"$//')
+    _call_tool "search_nodes" "{\"query\":\"${query_escaped}\",\"group_id\":\"${group_id}\"}"
+    ;;
+
+  search-facts|facts)
+    query="${1:?Usage: memory-cli search-facts <query> [group_id]}"
+    group_id="${2:-main}"
+    query_escaped=$(printf '%s' "$query" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" | sed 's/^"//;s/"$//')
+    _call_tool "search_memory_facts" "{\"query\":\"${query_escaped}\",\"group_id\":\"${group_id}\"}"
+    ;;
+
+  episodes)
+    group_id="${1:-main}"
+    last_n="${2:-10}"
+    _call_tool "get_episodes" "{\"group_ids\":[\"${group_id}\"],\"last_n\":${last_n}}"
+    ;;
+
+  status)
+    _call_tool "get_status" "{}"
+    ;;
+
+  clear)
+    group_id="${1:?Usage: memory-cli clear <group_id>}"
+    _call_tool "clear_graph" "{\"group_ids\":[\"${group_id}\"]}"
+    ;;
+
+  delete-episode)
+    uuid="${1:?Usage: memory-cli delete-episode <uuid>}"
+    _call_tool "delete_episode" "{\"uuid\":\"${uuid}\"}"
+    ;;
+
+  delete-edge)
+    uuid="${1:?Usage: memory-cli delete-edge <uuid>}"
+    _call_tool "delete_entity_edge" "{\"uuid\":\"${uuid}\"}"
+    ;;
+
+  get-edge)
+    uuid="${1:?Usage: memory-cli get-edge <uuid>}"
+    _call_tool "get_entity_edge" "{\"uuid\":\"${uuid}\"}"
+    ;;
+
+  tools)
+    _list_tools
+    ;;
+
+  raw)
+    tool_name="${1:?Usage: memory-cli raw <tool_name> <json_args>}"
+    args_json="${2:-{}}"
+    _call_tool "$tool_name" "$args_json"
+    ;;
+
+  help|--help|-h)
+    cat <<'HELP'
+memory-cli — Graphiti Knowledge Graph Memory (container edition)
+
+Usage: memory-cli <command> [args...]
+
+Commands:
+  add <name> <body> [group_id] [source]   Add episode to memory
+  search-nodes <query> [group_id]          Search for entities (nodes)
+  search-facts <query> [group_id]          Search for facts (relationships)
+  episodes [group_id] [last_n]             List recent episodes
+  status                                   Server status
+  clear <group_id>                         Clear graph (DESTRUCTIVE)
+  delete-episode <uuid>                    Delete episode by UUID
+  delete-edge <uuid>                       Delete entity edge by UUID
+  get-edge <uuid>                          Get entity edge by UUID
+  tools                                    List all available MCP tools
+  raw <tool_name> <json_args>              Call any MCP tool with raw JSON args
+
+Environment:
+  MEMORY_URL    Base URL (default: https://memory.persoack.org)
+HELP
+    ;;
+
+  *)
+    echo "Unknown command: $cmd" >&2
+    echo "Run 'memory-cli help' for usage" >&2
+    exit 1
+    ;;
+esac
