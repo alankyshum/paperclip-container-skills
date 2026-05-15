@@ -90,6 +90,27 @@ case "$cmd" in
         *) echo "Unknown option: $1" >&2; exit 1;;
       esac
     done
+    # Defense in depth: refuse --status done when the linked PR is still open (HARD RULE #0)
+    if echo "$body" | jq -e '.status == "done"' > /dev/null 2>&1 && command -v gh &>/dev/null; then
+      issue_data=$(api_get "/issues/$issue_id" 2>/dev/null) || issue_data="{}"
+      issue_identifier=$(echo "$issue_data" | jq -r '.identifier // ""')
+      issue_project=$(echo "$issue_data" | jq -r '.projectId // ""')
+      case "$issue_project" in
+        "c3d4e5f6-a7b8-9012-cdef-123456789012") _guard_repo="alankyshum/cablesnap";;
+        "d75631b7-a94c-45e6-a362-b40ea197c780") _guard_repo="alankyshum/opencode";;
+        *) _guard_repo="";;
+      esac
+      if [[ -n "$issue_identifier" && -n "$_guard_repo" ]]; then
+        _open_prs=$(gh pr list --repo "$_guard_repo" --state open \
+          --search "$issue_identifier in:title,body" \
+          --json number,isDraft 2>/dev/null || echo "[]")
+        _open_count=$(echo "$_open_prs" | jq 'length' 2>/dev/null || echo "0")
+        if [[ "$_open_count" -gt 0 ]]; then
+          echo "❌ GUARD: Refusing --status done for $issue_identifier — $_open_count open PR(s) in $_guard_repo. PR must be merged (mergedAt != null) and CI green before marking done. (HARD RULE #0)" >&2
+          exit 1
+        fi
+      fi
+    fi
     api_patch "/issues/$issue_id" "$body" | jq_or_cat '.'
     ;;
 
