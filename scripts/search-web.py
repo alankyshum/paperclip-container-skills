@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """Unified web search tool — Perplexity Sonar + self-hosted Gemini/Google Search.
-Adapted from Claude skill search--web for use inside Paperclip container."""
+
+Adapted from Claude skill search--web for use inside the Paperclip container.
+
+This version depends ONLY on the Python standard library (urllib) so it runs in
+minimal container images that have neither `pip` nor the `requests` package
+(see BLD-2335). Behaviour and CLI interface are unchanged from the requests-based
+version, so AGENTS-*.md commands such as `search-web.py search "..."` keep working.
+"""
 
 import argparse
 import json
 import os
 import re
 import sys
-
-import requests
+import urllib.error
+import urllib.request
 
 # --- Perplexity config ---
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
@@ -34,6 +41,33 @@ def strip_thinking(text):
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
+def _error(msg, hint=""):
+    print(json.dumps({"error": msg, "hint": hint}))
+    sys.exit(1)
+
+
+def _post_json(url, payload, headers, timeout):
+    """POST JSON via stdlib urllib. Returns (status_code, parsed_json_or_text).
+
+    Never raises for HTTP errors; the caller inspects the status code. Network
+    level failures (timeout, DNS, connection refused) raise urllib.error.URLError
+    or socket.timeout, which callers translate into structured errors.
+    """
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            status = resp.getcode()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace") if e.fp else ""
+        status = e.code
+    try:
+        return status, json.loads(body)
+    except (ValueError, json.JSONDecodeError):
+        return status, body
+
+
 def call_perplexity(model, query, timeout=120):
     api_key = PERPLEXITY_DEFAULT_KEY
     if not api_key:
@@ -42,24 +76,25 @@ def call_perplexity(model, query, timeout=120):
     payload = {"model": model, "messages": [{"role": "user", "content": query}]}
 
     try:
-        resp = requests.post(PERPLEXITY_API_URL, json=payload, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        citations = data.get("citations", [])
-        return answer, citations
-    except requests.exceptions.Timeout:
+        status, data = _post_json(PERPLEXITY_API_URL, payload, headers, timeout)
+    except TimeoutError:
         return _error("Request timed out", f"Perplexity did not respond within {timeout}s.")
-    except requests.exceptions.ConnectionError as e:
-        return _error("Connection failed", str(e))
-    except requests.exceptions.HTTPError as e:
-        status = e.response.status_code
-        detail = e.response.text[:500] if e.response.text else ""
-        if status == 401:
-            return _error("Authentication failed", "Check PERPLEXITY_API_KEY.")
-        elif status == 429:
-            return _error("Rate limited", "Wait before retrying.")
-        return _error(f"HTTP {status}", detail)
+    except urllib.error.URLError as e:
+        return _error("Connection failed", str(getattr(e, "reason", e)))
+
+    if status == 401:
+        return _error("Authentication failed", "Check PERPLEXITY_API_KEY.")
+    if status == 429:
+        return _error("Rate limited", "Wait before retrying.")
+    if status >= 400:
+        detail = data if isinstance(data, str) else json.dumps(data)
+        return _error(f"HTTP {status}", detail[:500])
+
+    if not isinstance(data, dict):
+        return _error("Unexpected response", str(data)[:500])
+    answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    citations = data.get("citations", [])
+    return answer, citations
 
 
 def call_gemini(query, system_prompt=None, timeout=90):
@@ -73,29 +108,23 @@ def call_gemini(query, system_prompt=None, timeout=90):
         payload["system_prompt"] = system_prompt
 
     try:
-        resp = requests.post(api_url, json=payload, headers=headers, timeout=timeout)
-    except requests.exceptions.Timeout:
+        status, data = _post_json(api_url, payload, headers, timeout)
+    except TimeoutError:
         return _error("Request timed out", f"Gemini search did not respond within {timeout}s.")
-    except requests.exceptions.ConnectionError as e:
-        return _error("Connection failed", str(e))
+    except urllib.error.URLError as e:
+        return _error("Connection failed", str(getattr(e, "reason", e)))
 
-    if resp.status_code == 401:
+    if status == 401:
         return _error("Authentication failed", "Check SEARCH_API_KEY.")
-    if resp.status_code == 429:
+    if status == 429:
         return _error("Rate limited", "Wait before retrying.")
-    if resp.status_code >= 400:
-        try:
-            detail = resp.json().get("detail", resp.text)
-        except Exception:
-            detail = resp.text
-        return _error(f"HTTP {resp.status_code}", detail)
+    if status >= 400:
+        detail = data.get("detail", data) if isinstance(data, dict) else data
+        return _error(f"HTTP {status}", str(detail)[:500])
 
-    return resp.json(), None
-
-
-def _error(msg, hint=""):
-    print(json.dumps({"error": msg, "hint": hint}))
-    sys.exit(1)
+    if not isinstance(data, dict):
+        return _error("Unexpected response", str(data)[:500])
+    return data, None
 
 
 def cmd_ask(args):
