@@ -1,1 +1,2 @@
+# Only context7-tool.py needs requests. search-web.py is stdlib-only (BLD-2335).
 requests>=2.31.0
